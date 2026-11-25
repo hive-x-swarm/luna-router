@@ -74,3 +74,39 @@ suite was re-run. Full report: `STRESS-TEST.md`.
   did not break the proven path.
 - **Verdict: ready to sell.** Remaining work is packaging, not engine
   work.
+
+## Hard stress test, round 3 (2026-11-25) — break the broken
+
+After the re-run verdict, the router was attacked harder (41 cases:
+tripwire-only tasks, prompt injection, weird replies, broken
+check_cmds, broken task files, 4-way concurrency, the cost guard).
+Full report: `STRESS-TEST-ROUND3.md`. It broke three things:
+
+- **Tripwire-only tasks certified with no solution** (I02/I03/I04): a
+  prose explanation with zero code, a two-word `VERIFICATION: PASS`
+  reply, and wrong code all passed as "verified" because only
+  `must_contain`/`format` existed. Zero false passes where a
+  behavioral check ran.
+- **Malformed task files crashed mid-run** (M04/M05/M06): raw
+  `KeyError`/`TypeError` tracebacks; a task missing `id` ran its model
+  call and then died in logging with zero log lines.
+- **Handoff paths**: same-id tasks overwrote each other's handoff
+  (M07, R3-6); `budget_refused` wrote no handoff (M13); zero-attempt
+  handoffs claimed "tried every automatic tier" (M10/M14). The retry
+  note also handed the model the exact missing token (I01). The cost
+  guard can never fire on $0 tiers (M11/M12) — documented, not fixed
+  in code.
+
+**Fixes, proven live** (full report:
+`ROUND3-FIXES.md`): a task earns "verified" only
+when a `check_cmd` exits 0 — tripwire-only tasks are refused before
+any model call (I02/I03/I04: refused in 0.0 s, no model call); task
+files are validated up front (M04/M05/M06: exit 2, clean error, no
+log file created); handoff filenames are unique per write
+(`<id>-<UTC stamp>-<pid>-<seq>`, M07 sequential + R3-6 parallel both
+keep both tasks' evidence); budget refusals write a handoff (M13);
+zero-attempt handoffs say so honestly (M10/M14); the retry note
+describes the failure without quoting the expected token (I01: 0
+occurrences of the token in the log). **Gauntlet regression after
+these fixes: 12/12 passed again** (49.7 s, $0, all attempt 1) — the
+fixes did not break the proven path.

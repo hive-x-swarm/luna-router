@@ -13,7 +13,7 @@ default. The router and the check are the whole trick, not the model.
 
 | Tier | Model | Cost per 1M tokens (in / out) | When it runs |
 |---|---|---|---|
-| tier0 local | Ollama Qwen2.5-Coder-7B on the owner's RTX 3060 Ti (8GB VRAM, ~5GB Q4, 30–50 tok/s) | $0.00 / $0.00 | First, every task |
+| tier0 local | Ollama qwen3:8b on the owner's RTX 3060 Ti (8GB VRAM, ~5.2 GB, ~15 tok/s) | $0.00 / $0.00 | First, every task |
 | tier1 cheap API | Groq Llama 3.1 8B | $0.05 / $0.08 | tier0 fails verification or errors |
 | tier2 capable API | DeepSeek V4.1 Flash, off-peak ($0.30 / $1.20 at peak) | $0.15 / $0.60 | tier1 fails |
 | tier3 Plus | ChatGPT Plus, paste handoff ONLY | — | all automatic tiers fail |
@@ -30,18 +30,27 @@ file is fetched only on demand. Minimum tokens per completed task.
 ## How it works
 
 1. Task in: text plus checks (`must_contain` string, `format` regex, and/or
-   a `check_cmd` that reads the reply on stdin and must exit 0). At least
-   one check is required — a task with no checks at all is refused before
-   any model call, so nothing can ever be reported verified by accident.
+   a `check_cmd` that reads the reply on stdin and must exit 0). A
+   `check_cmd` is REQUIRED — a task is only "verified" when a behavioral
+   check exits 0. `must_contain` / `format` are tripwires, not proof: a
+   task with only tripwires (or no checks at all) is refused before any
+   model call, so nothing can ever be reported verified by accident. The
+   task file is validated up front: every entry must be a JSON object
+   with a non-empty string `id` and `text`; unknown fields are warned
+   about on stderr and ignored.
 2. Try tier0, then tier1, then tier2, in that order. Max 2 attempts per
    tier. Every reply is verified; a reply that fails verification does NOT
    count as a success, even if it looks right.
 3. Retry once per tier on verification failure, then escalate. The retry
    re-asks with the failure reason attached (which check failed and why),
    so attempt 2 is a real second shot, not an identical re-ask.
-4. If all tiers fail, write the Plus handoff file (`runs/plus-handoff-<id>.md`)
+4. If all tiers fail, write the Plus handoff file
+   (`runs/plus-handoff-<id>-<UTC stamp>-<pid>-<n>.md`, unique per write so
+   two tasks sharing an id can never overwrite each other's evidence)
    and stop with a clear FAILED status. The router never calls Plus
-   automatically — Plus has no API.
+   automatically — Plus has no API. When no model call was ever made
+   (e.g. zero attempts, or an empty tiers list) the handoff says so
+   honestly instead of claiming every tier was tried.
 5. Every attempt is logged as JSONL (tier, tokens in/out, cost, verify
    pass/fail, error). A per-task summary line is printed, plus a session
    summary at the end.
@@ -54,7 +63,11 @@ generation + verification, with the split kept as `generation_elapsed` /
 Cost guards: per-task budget (default $0.01) and session budget (default
 $0.10), both configurable by flag. Before every attempt the router estimates
 the attempt's cost; if it would breach a budget, the tier is refused and the
-task fails honestly with $0 spent on that attempt.
+task fails honestly with $0 spent on that attempt — and a Plus handoff is
+written, like every other failure path. The guard only applies to PAID
+tiers: on $0 tiers an attempt costs exactly $0.00, so no non-negative
+budget can ever refuse it (a negative budget is the only trigger, and it
+refuses before any model call).
 
 Token counts are chars/4 estimates unless the server reports real usage.
 That is documented, not exact.
@@ -74,6 +87,14 @@ That is documented, not exact.
   turned a failure into a pass by naming the failure reason (V06).
 - `check_cmd` is the real gate — `must_contain` / `format` are
   tripwires, not proof. Write checks that pin the answer down.
+- Round 3 (2026-11-25) broke the tripwire-only hole open and the fixes
+  are in: a task with no `check_cmd` is refused before any model call,
+  task files are validated up front (bad entries exit 2 cleanly instead
+  of crashing mid-run), handoff filenames are unique per write, budget
+  refusals write a handoff, zero-attempt handoffs say so honestly, and
+  the retry note no longer quotes the expected token. Details:
+  `ROUND3-FIXES.md`. Gauntlet regression after
+  these fixes: 12/12 again (49.7 s, $0).
 
 ## Files
 
@@ -110,7 +131,7 @@ running. No real API keys, no real API calls, no spending.
 On the owner's PC (RTX 3060 Ti, 8GB VRAM):
 
 1. Install Ollama: https://ollama.com/download (Windows installer).
-2. `ollama pull qwen2.5-coder:7b` (~4.7GB, Q4). Verify: `ollama run qwen2.5-coder:7b "Say the word BANANA"`.
+2. `ollama pull qwen3:8b` (~5.2GB). Verify: `ollama run qwen3:8b "Say the word BANANA"`.
 3. Copy `tiers-real.json.example` to `tiers-real.json` (never put a key in it).
 4. Set keys in the environment only when the owner approves paid use:
    `GROQ_API_KEY`, `DEEPSEEK_API_KEY`. The router reads them from the
@@ -136,4 +157,13 @@ On the owner's PC (RTX 3060 Ti, 8GB VRAM):
 - The cost guard estimates an attempt's cost before calling; a model that
   returns a much longer reply than assumed costs slightly more than
   estimated. The guard is a brake, not a hard cap on a single in-flight call.
+  On $0 tiers the guard cannot fire at all (an attempt costs exactly $0.00)
+  — it only applies to paid tiers.
+- The router never sandboxes `check_cmd`: a check that execs model output
+  runs with the router's cwd and privileges. Never exec a reply outside a
+  sandbox dir, and never run the router from a directory containing
+  anything precious.
+- A check's exit code is the only signal — stdout text is ignored. A check
+  that prints "FAIL" and exits 0 passes; one that prints "PASS" and exits
+  1 fails.
 - Not tested on Windows yet. Stdlib-only by construction.

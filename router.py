@@ -3,14 +3,17 @@
 
 Small cheap model tries every task first, the reply gets verified, and only
 failures escalate to a bigger model. A task with no verified reply is FAILED,
-never claimed as a success. A task with NO checks at all is refused before
-any model call — it can never be "verified" by definition.
+never claimed as a success. A task is only "verified" when a behavioral
+check_cmd exits 0 — must_contain / format are tripwires, not proof, so a
+task with no check_cmd is refused before any model call (it can never be
+"verified" by definition, and a two-word reply matching a token is not a
+solution).
 
 Stdlib only. No real API keys are needed for testing (all tiers point at the
 fake server). $0 in test mode. Never prints a secret or token value.
 
 Tiers (cost table, prices from research Nov 2026, per 1M tokens):
-  tier0 local  Ollama Qwen2.5-Coder-7B, RTX 3060 Ti   $0.00 in / $0.00 out
+  tier0 local  Ollama qwen3:8b, RTX 3060 Ti            $0.00 in / $0.00 out
   tier1 cheap  Groq Llama 3.1 8B                      $0.05 in / $0.08 out
   tier2 cap.   DeepSeek V4.1 Flash (off-peak)         $0.15 in / $0.60 out
   tier3 plus   ChatGPT Plus, paste handoff ONLY — the router never calls it.
@@ -37,10 +40,15 @@ Task file format (JSON list):
   [{"id": "T1", "text": "Compute 6*7 and output the number alone.",
     "must_contain": "42", "format": "^\\d+$",
     "check_cmd": "grep -q 42"}, ...]
-  must_contain / format / check_cmd are all optional, but AT LEAST ONE
-  check is required: a task with no checks is refused before any model
-  call (it can never be "verified"). When present, ALL of them must pass.
-  check_cmd reads the reply on stdin and must exit 0.
+  A check_cmd is REQUIRED: a task earns "verified" only when a behavioral
+  check exits 0. must_contain / format are optional tripwires, but a task
+  with only tripwires (or no checks at all) is refused before any model
+  call — a reply that merely contains a token is not a solution. When a
+  check_cmd is present, ALL checks present must pass. check_cmd reads the
+  reply on stdin and must exit 0 (the exit code is the only signal; stdout
+  text is ignored). The task file is validated up front: every entry must
+  be a JSON object with a non-empty string `id` and `text`; unknown fields
+  are warned about and ignored.
 
 Exit codes: 0 = every task passed, 1 = one or more tasks failed,
             2 = usage/config error (missing context, bad task file, ...).
@@ -428,40 +436,90 @@ def verify_reply(reply, task, timeout=DEFAULT_TIMEOUT):
     return passed, details
 
 
+def _redact_expected(task, text):
+    """Redact expected literals from text shown to the model (round 3, I01).
+
+    The retry note must never hand the model the exact token or pattern
+    the check is looking for — that turns a failed check into a
+    fill-in-the-blank. Any must_contain literal or format pattern that
+    appears in the text is replaced; everything else is kept verbatim.
+    """
+    for field in ("must_contain", "format"):
+        lit = task.get(field)
+        if isinstance(lit, str) and lit and lit in text:
+            text = text.replace(lit, "[expected value redacted]")
+    return text
+
+
 def verify_failure_reason(task, details):
     """Human-readable reason a reply failed verification, for retries.
 
-    Names the failing check and its stderr so the next attempt is a
-    real re-ask with new information, not a blind repeat at temp 0.
+    Describes WHAT failed without quoting the expected answer: the
+    retry note names the failing check, never the exact token or
+    pattern it wanted (round 3, I01 — the old note told the model the
+    missing token verbatim). check_cmd stderr is kept — it names real
+    behavior, not the answer key — with any expected literal redacted
+    out of it. The full expected values stay in the task file and the
+    Plus handoff, where the human (not the model) reads them.
     """
     parts = []
     if details.get("must_contain") is False:
-        parts.append("must_contain %r not found in the reply"
-                     % task.get("must_contain"))
+        parts.append("a required token is missing from the reply")
     if details.get("format") is False:
-        parts.append("format regex %r did not match the reply"
-                     % task.get("format"))
+        parts.append("the reply did not match the required format")
     if "format_error" in details:
         parts.append("format regex error: %s" % details["format_error"])
     if details.get("check_cmd") is False:
-        msg = "check_cmd %r exited non-zero" % task.get("check_cmd")
+        msg = "the behavioral check failed (check command exited non-zero)"
         if details.get("check_cmd_stderr"):
-            msg += " (stderr: %s)" % details["check_cmd_stderr"]
+            msg += " (stderr: %s)" % _redact_expected(
+                task, details["check_cmd_stderr"])
         parts.append(msg)
     if details.get("check_cmd_error"):
         parts.append("check_cmd error: %s" % details["check_cmd_error"])
     return "; ".join(parts) if parts else "verification failed"
 
 
+# Per-process handoff counter. Handoff filenames must be unique per write:
+# two tasks sharing an id (sequential or in parallel) used to overwrite
+# each other's handoff and silently destroy evidence (round 3, M07/R3-6).
+# The filename is <id>-<UTC stamp>-<pid>-<seq>, so no two writes in any
+# process can collide. The id is sanitized for the filesystem.
+_HANDOFF_SEQ = [0]
+
+
+def _handoff_filename(task_id):
+    safe = re.sub(r"[^A-Za-z0-9_.-]", "_", str(task_id)) or "task"
+    _HANDOFF_SEQ[0] += 1
+    stamp = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
+    return "plus-handoff-%s-%s-%d-%d.md" % (safe, stamp, os.getpid(),
+                                            _HANDOFF_SEQ[0])
+
+
 def write_plus_handoff(out_dir, task, attempts, task_cost, context_path):
-    """Tier 3 is a paste handoff, never an automatic call. Write it and stop."""
+    """Tier 3 is a paste handoff, never an automatic call. Write it and stop.
+
+    The filename is unique per write (see _HANDOFF_SEQ). The intro text is
+    honest about what actually happened: when no model call was ever made
+    (e.g. --max-attempts-per-tier 0, or an empty tiers list) the handoff
+    says so instead of claiming "the router tried every automatic tier"
+    (round 3, M10/M14).
+    """
     os.makedirs(out_dir, exist_ok=True)
-    path = os.path.join(out_dir, "plus-handoff-%s.md" % task["id"])
-    lines = [
-        "# Plus handoff — task %s (FAILED on all automatic tiers)" % task["id"],
-        "",
-        "Paste this into ChatGPT Plus. The router tried every automatic tier,",
-        "verified every reply, and none passed. Do not trust an unverified reply.",
+    path = os.path.join(out_dir, _handoff_filename(task["id"]))
+    real_attempts = [a for a in attempts
+                     if a["status"] in ("verified", "verify_failed", "error")]
+    if real_attempts:
+        title = ("# Plus handoff — task %s (FAILED on all automatic tiers)"
+                 % task["id"])
+        intro = ["Paste this into ChatGPT Plus. The router tried every automatic tier,",
+                 "verified every reply, and none passed. Do not trust an unverified reply."]
+    else:
+        title = ("# Plus handoff — task %s (no automatic tier was attempted)"
+                 % task["id"])
+        intro = ["Paste this into ChatGPT Plus. No automatic tier was actually attempted,",
+                 "so no reply was verified. Do not trust an unverified reply."]
+    lines = [title, ""] + intro + [
         "",
         "## Task",
         "",
@@ -474,9 +532,12 @@ def write_plus_handoff(out_dir, task, attempts, task_cost, context_path):
         "## What was tried",
         "",
     ]
-    for a in attempts:
-        lines.append("- %s attempt %d: %s (cost $%.6f)"
-                     % (a["tier"], a["attempt"], a["status"], a["cost_usd"]))
+    if attempts:
+        for a in attempts:
+            lines.append("- %s attempt %d: %s (cost $%.6f)"
+                         % (a["tier"], a["attempt"], a["status"], a["cost_usd"]))
+    else:
+        lines.append("- (no attempts were made)")
     lines += [
         "",
         "## Cost spent before handoff",
@@ -500,7 +561,8 @@ def write_plus_handoff(out_dir, task, attempts, task_cost, context_path):
 def run_task(task, tiers, context_text, context_path, args, log_f, session):
     """Try tier 0, 1, 2 in order; max 2 attempts per tier; verify every reply.
 
-    A task with no checks is refused before any model call (F1). A
+    A task with no check_cmd is refused before any model call (F1, extended
+    in round 3): only a behavioral check can earn "verified". A
     verify_failed attempt appends the failure reason to the prompt for
     the next attempt, so a retry at temp 0 is a real re-ask, not a
     blind repeat (F3). Attempt `elapsed` includes verification time.
@@ -524,9 +586,13 @@ def run_task(task, tiers, context_text, context_path, args, log_f, session):
         log_f.flush()
         attempts.append(rec)
 
-    # F1 (2026-11-25 stress test, D05): a task with zero verification
-    # criteria is unverified by definition. Refuse it before calling
-    # the model — never report it "verified".
+    # F1 (2026-11-25 stress test, D05), extended in round 3 (I02/I03/I04):
+    # a task earns "verified" ONLY when a behavioral check_cmd exits 0.
+    # must_contain / format are tripwires, not proof — a two-word reply
+    # matching a token, wrong code containing the token, or prose with
+    # zero code all used to certify as "verified". A task with no
+    # check_cmd (including a task with no checks at all) is refused
+    # before any model call.
     if not (task.get("must_contain") or task.get("format")
             or task.get("check_cmd")):
         log_attempt({"tier": "-", "model": "-", "attempt": 0,
@@ -537,6 +603,19 @@ def run_task(task, tiers, context_text, context_path, args, log_f, session):
                      "elapsed": 0.0})
         return {"id": task["id"], "status": "FAILED",
                 "reason": "no checks defined — refusing to verify",
+                "tier": None, "attempts": attempts, "cost_usd": 0.0,
+                "elapsed": time.time() - task_started}
+    if not task.get("check_cmd"):
+        log_attempt({"tier": "-", "model": "-", "attempt": 0,
+                     "status": "refused",
+                     "reason": "no check_cmd — only a behavioral check "
+                               "can verify a reply",
+                     "prompt_tokens": 0, "completion_tokens": 0,
+                     "cost_usd": 0.0, "verify": {}, "error": "",
+                     "elapsed": 0.0})
+        return {"id": task["id"], "status": "FAILED",
+                "reason": "no check_cmd — only a behavioral check "
+                          "can verify a reply",
                 "tier": None, "attempts": attempts, "cost_usd": 0.0,
                 "elapsed": time.time() - task_started}
 
@@ -575,10 +654,15 @@ def run_task(task, tiers, context_text, context_path, args, log_f, session):
                              "prompt_tokens": 0, "completion_tokens": 0,
                              "cost_usd": 0.0, "verify": {}, "error": "",
                              "elapsed": 0.0})
+                # Round 3 (M13): a budget refusal writes a handoff like
+                # every other failure path — refusing the paste path left
+                # the user with nothing to paste.
+                handoff = write_plus_handoff(args.out_dir, task, attempts,
+                                             task_cost, context_path)
                 return {"id": task["id"], "status": "FAILED",
                         "reason": "session budget refused",
                         "tier": tier["name"], "attempts": attempts,
-                        "cost_usd": task_cost,
+                        "cost_usd": task_cost, "handoff": handoff,
                         "elapsed": time.time() - task_started}
             if task_cost + est_cost > args.task_budget:
                 log_attempt({"tier": tier["name"], "model": tier["model"],
@@ -587,10 +671,12 @@ def run_task(task, tiers, context_text, context_path, args, log_f, session):
                              "prompt_tokens": 0, "completion_tokens": 0,
                              "cost_usd": 0.0, "verify": {}, "error": "",
                              "elapsed": 0.0})
+                handoff = write_plus_handoff(args.out_dir, task, attempts,
+                                             task_cost, context_path)
                 return {"id": task["id"], "status": "FAILED",
                         "reason": "task budget hit",
                         "tier": tier["name"], "attempts": attempts,
-                        "cost_usd": task_cost,
+                        "cost_usd": task_cost, "handoff": handoff,
                         "elapsed": time.time() - task_started}
             res = call_model(tier, messages, args.timeout)
             if not res["ok"]:
@@ -653,6 +739,51 @@ def run_task(task, tiers, context_text, context_path, args, log_f, session):
             "handoff": handoff, "elapsed": time.time() - task_started}
 
 
+KNOWN_TASK_FIELDS = {"id", "text", "must_contain", "format", "check_cmd"}
+
+
+def validate_tasks(tasks):
+    """Validate a task file up front (round 3, M04/M05/M06/M08).
+
+    Every entry must be a JSON object with a non-empty string `id` and
+    `text`; check values, when present, must be strings. A bad entry
+    exits 2 with a clean error BEFORE any model call — the old code
+    crashed mid-run with a raw KeyError/TypeError traceback, and a
+    task missing `id` ran its model call and then died in log_attempt
+    with zero log lines, erasing the attempt from the audit trail.
+    Unknown fields are warned on stderr (and ignored); duplicate ids
+    are warned too — handoffs are unique per write so duplicates no
+    longer destroy evidence, but distinct ids keep the log readable.
+    """
+    seen = set()
+    for i, t in enumerate(tasks):
+        if not isinstance(t, dict):
+            print("ERROR: task file entry %d is not a JSON object: %r"
+                  % (i, t), file=sys.stderr)
+            sys.exit(2)
+        for field in ("id", "text"):
+            v = t.get(field)
+            if not isinstance(v, str) or not v:
+                print("ERROR: task file entry %d is missing a non-empty "
+                      "string '%s'" % (i, field), file=sys.stderr)
+                sys.exit(2)
+        for field in ("must_contain", "format", "check_cmd"):
+            if field in t and not isinstance(t[field], str):
+                print("ERROR: task %s: '%s' must be a string, got %s"
+                      % (t["id"], field, type(t[field]).__name__),
+                      file=sys.stderr)
+                sys.exit(2)
+        unknown = sorted(set(t) - KNOWN_TASK_FIELDS)
+        if unknown:
+            print("WARNING: task %s: unknown field(s) ignored: %s"
+                  % (t["id"], ", ".join(unknown)), file=sys.stderr)
+        if t["id"] in seen:
+            print("WARNING: task file has duplicate id %r — handoffs stay "
+                  "unique per write, but distinct ids keep the log readable"
+                  % t["id"], file=sys.stderr)
+        seen.add(t["id"])
+
+
 def main():
     ap = argparse.ArgumentParser(description="Luna router — cheap model first, "
                                             "verify, escalate only on failure")
@@ -695,6 +826,10 @@ def main():
     else:
         print("ERROR: pass --task-file or --task", file=sys.stderr)
         sys.exit(2)
+
+    # Round 3 (M04/M05/M06): validate the whole file before any model
+    # call — one bad entry must not crash the session mid-run.
+    validate_tasks(tasks)
 
     os.makedirs(args.out_dir, exist_ok=True)
     log_path = args.log or os.path.join(args.out_dir, "router-log.jsonl")
