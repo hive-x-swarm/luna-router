@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
-"""router.py — the Luna router: cheap model first, every reply verified.
+"""router.py — the Luna router: Astra-level results for Luna money.
 
 Small cheap model tries every task first, the reply gets verified, and only
 failures escalate to a bigger model. A task with no verified reply is FAILED,
-never claimed as a success.
+never claimed as a success. A task with NO checks at all is refused before
+any model call — it can never be "verified" by definition.
 
 Stdlib only. No real API keys are needed for testing (all tiers point at the
 fake server). $0 in test mode. Never prints a secret or token value.
@@ -20,7 +21,7 @@ Adapters: 'openai' (default, OpenAI-compatible chat completions),
 via one-shot SSH curl — the VM cannot reach the PC directly, so each
 attempt runs curl on the PC against its own loopback Ollama; the request
 body rides on the SSH stdin, never in a shell string). See
-tiers.json.example for a local run: tier0 is local Ollama qwen3:8b,
+tiers-real-pc.json for the real PC run: tier0 is PC Ollama qwen3:8b,
 tiers 1-2 disabled (no API keys), tier3 Plus.
 
 Default context: the HiveLite index (2,686 tokens). The full file is fetched
@@ -36,8 +37,10 @@ Task file format (JSON list):
   [{"id": "T1", "text": "Compute 6*7 and output the number alone.",
     "must_contain": "42", "format": "^\\d+$",
     "check_cmd": "grep -q 42"}, ...]
-  must_contain / format / check_cmd are all optional; when present, ALL of
-  them must pass. check_cmd reads the reply on stdin and must exit 0.
+  must_contain / format / check_cmd are all optional, but AT LEAST ONE
+  check is required: a task with no checks is refused before any model
+  call (it can never be "verified"). When present, ALL of them must pass.
+  check_cmd reads the reply on stdin and must exit 0.
 
 Exit codes: 0 = every task passed, 1 = one or more tasks failed,
             2 = usage/config error (missing context, bad task file, ...).
@@ -77,7 +80,10 @@ FRONTIER_COMPARISON = {
 
 DEFAULT_TASK_BUDGET = 0.01
 DEFAULT_SESSION_BUDGET = 0.10
-DEFAULT_TIMEOUT = 10
+# Raised from 10s (2026-11-25 stress test, suite G): a trivial 5-function
+# module needs ~11s of generation, so the old default failed ordinary tasks
+# on first run. --timeout still overrides this.
+DEFAULT_TIMEOUT = 300
 DEFAULT_MAX_ATTEMPTS_PER_TIER = 2
 ASSUMED_COMPLETION_TOKENS = 250
 
@@ -184,6 +190,10 @@ def call_ollama_ssh(tier, messages, timeout):
     blocked), so each attempt runs curl on the PC against its own loopback
     Ollama (127.0.0.1:11434). The request body is fed to the remote curl
     on stdin (--data-binary @-), so the payload is never shell-quoted.
+    The SSH target comes from the tier config: `host` + `ssh_user`
+    (and `ssh_proxy` for the ProxyCommand, when the VM needs one to
+    reach the host). Nothing host-specific is hardcoded here — put your
+    own values in your tiers file, never in this file.
     One SSH per attempt, no persistent process or forwarding tunnel
     (SSH-launched processes die on disconnect anyway). Slow on the
     3060 Ti — callers should pass a generous timeout (180s); curl's own
@@ -206,17 +216,17 @@ def call_ollama_ssh(tier, messages, timeout):
     remote = ("curl -s --max-time %d -X POST http://127.0.0.1:11434"
               "/v1/chat/completions -H \"Content-Type: application/json\""
               " --data-binary @-" % curl_timeout)
-    # The two placeholders below are yours to fill in: the SSH target
-    # of the machine running Ollama, and the proxy command if your
-    # network needs one (omit the -o ProxyCommand line if it does not).
-    cmd = [
-        "ssh",
-        "-o", "ProxyCommand=nc -X connect -x <YOUR_PROXY_HOST:PORT> %h %p",
+    cmd = ["ssh"]
+    if tier.get("ssh_proxy"):
+        cmd += ["-o", "ProxyCommand=nc -X connect -x %s %%h %%p"
+                % tier["ssh_proxy"]]
+    cmd += [
         "-o", "UserKnownHostsFile=/home/hatch/.ssh/known_hosts",
         "-o", "IdentitiesOnly=yes",
         "-o", "ConnectTimeout=20",
         "-i", os.path.expanduser("~/.ssh/id_ed25519"),
-        "user@<YOUR_PC_HOST>",
+        "%s@%s" % (tier.get("ssh_user", "user"),
+                   tier.get("host", "<YOUR_PC_HOST>")),
         remote,
     ]
     try:
@@ -379,8 +389,14 @@ def call_model(tier, messages, timeout):
                 "elapsed": time.time() - started}
 
 
-def verify_reply(reply, task):
-    """A reply passes only if EVERY check present in the task passes."""
+def verify_reply(reply, task, timeout=DEFAULT_TIMEOUT):
+    """A reply passes only if EVERY check present in the task passes.
+
+    The returned details also carry the check's stderr (truncated to
+    500 chars) so the audit trail shows WHY a check failed, not just
+    that it did. `timeout` is the check_cmd timeout in seconds — it
+    defaults to DEFAULT_TIMEOUT (300s) and follows the --timeout flag.
+    """
     details = {}
     passed = True
     if task.get("must_contain") is not None:
@@ -399,14 +415,42 @@ def verify_reply(reply, task):
         try:
             proc = subprocess.run(shlex.split(task["check_cmd"]),
                                   input=reply.encode("utf-8"),
-                                  capture_output=True, timeout=10)
+                                  capture_output=True, timeout=timeout)
             ok = proc.returncode == 0
+            err = proc.stderr.decode("utf-8", errors="replace").strip()
+            if err:
+                details["check_cmd_stderr"] = err[:500]
         except (subprocess.TimeoutExpired, FileNotFoundError, ValueError) as e:
             details["check_cmd_error"] = str(e)
             ok = False
         details["check_cmd"] = ok
         passed = passed and ok
     return passed, details
+
+
+def verify_failure_reason(task, details):
+    """Human-readable reason a reply failed verification, for retries.
+
+    Names the failing check and its stderr so the next attempt is a
+    real re-ask with new information, not a blind repeat at temp 0.
+    """
+    parts = []
+    if details.get("must_contain") is False:
+        parts.append("must_contain %r not found in the reply"
+                     % task.get("must_contain"))
+    if details.get("format") is False:
+        parts.append("format regex %r did not match the reply"
+                     % task.get("format"))
+    if "format_error" in details:
+        parts.append("format regex error: %s" % details["format_error"])
+    if details.get("check_cmd") is False:
+        msg = "check_cmd %r exited non-zero" % task.get("check_cmd")
+        if details.get("check_cmd_stderr"):
+            msg += " (stderr: %s)" % details["check_cmd_stderr"]
+        parts.append(msg)
+    if details.get("check_cmd_error"):
+        parts.append("check_cmd error: %s" % details["check_cmd_error"])
+    return "; ".join(parts) if parts else "verification failed"
 
 
 def write_plus_handoff(out_dir, task, attempts, task_cost, context_path):
@@ -454,7 +498,13 @@ def write_plus_handoff(out_dir, task, attempts, task_cost, context_path):
 
 
 def run_task(task, tiers, context_text, context_path, args, log_f, session):
-    """Try tier 0, 1, 2 in order; max 2 attempts per tier; verify every reply."""
+    """Try tier 0, 1, 2 in order; max 2 attempts per tier; verify every reply.
+
+    A task with no checks is refused before any model call (F1). A
+    verify_failed attempt appends the failure reason to the prompt for
+    the next attempt, so a retry at temp 0 is a real re-ask, not a
+    blind repeat (F3). Attempt `elapsed` includes verification time.
+    """
     attempts = []
     task_cost = 0.0
     task_started = time.time()
@@ -474,6 +524,23 @@ def run_task(task, tiers, context_text, context_path, args, log_f, session):
         log_f.flush()
         attempts.append(rec)
 
+    # F1 (2026-11-25 stress test, D05): a task with zero verification
+    # criteria is unverified by definition. Refuse it before calling
+    # the model — never report it "verified".
+    if not (task.get("must_contain") or task.get("format")
+            or task.get("check_cmd")):
+        log_attempt({"tier": "-", "model": "-", "attempt": 0,
+                     "status": "refused",
+                     "reason": "no checks defined — refusing to verify",
+                     "prompt_tokens": 0, "completion_tokens": 0,
+                     "cost_usd": 0.0, "verify": {}, "error": "",
+                     "elapsed": 0.0})
+        return {"id": task["id"], "status": "FAILED",
+                "reason": "no checks defined — refusing to verify",
+                "tier": None, "attempts": attempts, "cost_usd": 0.0,
+                "elapsed": time.time() - task_started}
+
+    pending_retry_note = None
     for tier in tiers:
         if tier.get("kind") == "plus":
             continue
@@ -488,6 +555,13 @@ def run_task(task, tiers, context_text, context_path, args, log_f, session):
                          "elapsed": 0.0})
             continue
         for attempt_no in range(1, args.max_attempts_per_tier + 1):
+            # F3: a retry note from the previous verify_failed attempt
+            # rides along in this attempt's prompt (already appended to
+            # `messages` below) and is recorded in the log with it.
+            note_used = pending_retry_note
+            pending_retry_note = None
+            retry_note_field = ({"retry_note": note_used}
+                                if note_used else {})
             # Cost guard, checked before every attempt.
             est_cost = ((prompt_tokens_est * COST_TABLE.get(tier["model"], {})
                          .get("in", 0.0)
@@ -527,11 +601,19 @@ def run_task(task, tiers, context_text, context_path, args, log_f, session):
                              "cost_usd": cost, "verify": {},
                              "error": res["error"],
                              "http_status": res["http_status"],
-                             "elapsed": res["elapsed"]})
+                             "elapsed": res["elapsed"],
+                             **retry_note_field})
                 continue
             reply_cost = cost_usd(tier["model"], res["prompt_tokens"],
                                   res["completion_tokens"])
-            verified, verify_details = verify_reply(res["reply"], task)
+            verify_started = time.time()
+            verified, verify_details = verify_reply(res["reply"], task,
+                                                    args.timeout)
+            verify_elapsed = time.time() - verify_started
+            # F3: `elapsed` now covers generation AND verification (it
+            # used to be generation only, so a hanging check was
+            # invisible in the log). The split is kept for the trail.
+            attempt_elapsed = res["elapsed"] + verify_elapsed
             task_cost += reply_cost
             session["spent"] += reply_cost
             log_attempt({"tier": tier["name"], "model": tier["model"],
@@ -541,7 +623,10 @@ def run_task(task, tiers, context_text, context_path, args, log_f, session):
                          "completion_tokens": res["completion_tokens"],
                          "cost_usd": reply_cost, "verify": verify_details,
                          "error": "", "http_status": res["http_status"],
-                         "elapsed": res["elapsed"]})
+                         "elapsed": attempt_elapsed,
+                         "generation_elapsed": res["elapsed"],
+                         "verify_elapsed": verify_elapsed,
+                         **retry_note_field})
             if verified:
                 return {"id": task["id"], "status": "PASSED",
                         "reason": "verified on %s attempt %d"
@@ -549,7 +634,17 @@ def run_task(task, tiers, context_text, context_path, args, log_f, session):
                         "tier": tier["name"], "attempts": attempts,
                         "cost_usd": task_cost, "reply": res["reply"],
                         "elapsed": time.time() - task_started}
-            # verify_failed: retry same tier (up to max), then escalate.
+            # verify_failed: the next attempt (same tier, or the next
+            # tier on escalation) is re-asked WITH the failure reason,
+            # so a temp-0 retry has a real chance to fix it instead of
+            # repeating the identical mistake.
+            pending_retry_note = (
+                "Your previous reply failed verification: %s. "
+                "Fix the problem and reply again with corrected code — "
+                "do not repeat the same answer."
+                % verify_failure_reason(task, verify_details))
+            messages.append({"role": "user",
+                             "content": pending_retry_note})
     handoff = write_plus_handoff(args.out_dir, task, attempts, task_cost,
                                  context_path)
     return {"id": task["id"], "status": "FAILED",

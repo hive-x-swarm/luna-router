@@ -1,69 +1,139 @@
-# Luna router
+# Luna router — Astra-level results for Luna money
 
-Cheap model first, every reply verified, escalate only on failure. A task with no verified reply is FAILED, never claimed as a success.
+Small cheap model tries every task first. The reply gets verified. Only
+failures escalate to a bigger model. A task with no verified reply is FAILED,
+never claimed as a success.
 
-Standard library only. No dependencies. `$0` in local mode.
+## The idea in one line
+
+Route, don't upgrade. The expensive model is the last resort, not the
+default. The router and the check are the whole trick, not the model.
+
+## Tiers
+
+| Tier | Model | Cost per 1M tokens (in / out) | When it runs |
+|---|---|---|---|
+| tier0 local | Ollama Qwen2.5-Coder-7B on the owner's RTX 3060 Ti (8GB VRAM, ~5GB Q4, 30–50 tok/s) | $0.00 / $0.00 | First, every task |
+| tier1 cheap API | Groq Llama 3.1 8B | $0.05 / $0.08 | tier0 fails verification or errors |
+| tier2 capable API | DeepSeek V4.1 Flash, off-peak ($0.30 / $1.20 at peak) | $0.15 / $0.60 | tier1 fails |
+| tier3 Plus | ChatGPT Plus, paste handoff ONLY | — | all automatic tiers fail |
+
+Alternate cheap API noted in research: DeepInfra Llama 3.1 8B at $0.02 / $0.04.
+Frontier prices for comparison only (the router never calls them): Claude
+Opus $5 / $25, GPT-5.4 $2.50 / $15. Same task that costs $0.000135 on tier1
+costs $0.013515 on Claude Opus — about 100x.
+
+Default context is the HiveLite index
+(`~/workspace/hive-lite-pack/HIVE-LITE-INDEX.md`, 2,686 tokens). The full
+file is fetched only on demand. Minimum tokens per completed task.
 
 ## How it works
 
-Four tiers, cheapest first:
+1. Task in: text plus checks (`must_contain` string, `format` regex, and/or
+   a `check_cmd` that reads the reply on stdin and must exit 0). At least
+   one check is required — a task with no checks at all is refused before
+   any model call, so nothing can ever be reported verified by accident.
+2. Try tier0, then tier1, then tier2, in that order. Max 2 attempts per
+   tier. Every reply is verified; a reply that fails verification does NOT
+   count as a success, even if it looks right.
+3. Retry once per tier on verification failure, then escalate. The retry
+   re-asks with the failure reason attached (which check failed and why),
+   so attempt 2 is a real second shot, not an identical re-ask.
+4. If all tiers fail, write the Plus handoff file (`runs/plus-handoff-<id>.md`)
+   and stop with a clear FAILED status. The router never calls Plus
+   automatically — Plus has no API.
+5. Every attempt is logged as JSONL (tier, tokens in/out, cost, verify
+   pass/fail, error). A per-task summary line is printed, plus a session
+   summary at the end.
 
-| Tier | Model | Cost |
-|---|---|---|
-| tier0 | Local Ollama (qwen3:8b in our proof run) | $0.00 |
-| tier1 | Cheap API model | pennies per 1M tokens |
-| tier2 | Capable API model | low per-1M-token price |
-| tier3 | ChatGPT Plus, paste handoff only | never an automatic call |
+Default timeout is 300 s for both generation and the `check_cmd`
+(`--timeout` overrides it). Attempt `elapsed` in the log covers
+generation + verification, with the split kept as `generation_elapsed` /
+`verify_elapsed`, and check stderr is captured (truncated to 500 chars).
 
-For each task, the router calls tier0 first. The reply is verified three ways, and **all three must pass**:
+Cost guards: per-task budget (default $0.01) and session budget (default
+$0.10), both configurable by flag. Before every attempt the router estimates
+the attempt's cost; if it would breach a budget, the tier is refused and the
+task fails honestly with $0 spent on that attempt.
 
-1. **must-contain** — the reply contains a required string.
-2. **format** — the reply matches a required regex.
-3. **check_cmd** — a shell command reads the reply on stdin and exits 0.
+Token counts are chars/4 estimates unless the server reports real usage.
+That is documented, not exact.
 
-If verification fails, the router retries once on the same tier, then escalates to the next tier. If every tier fails, it writes a paste handoff for a human to run in ChatGPT Plus and reports FAILED. It never claims an unverified success.
+## Proof (2026-11-25)
 
-Cost guards stop a runaway task: a per-task budget and a per-session budget, both `$0.01` / `$0.10` by default in test mode and configurable.
+- **Gauntlet: 12/12 verified, $0, 76.6 s** — every automatable check
+  passed independent ground-truth verification. Details: `PROOF.md`.
+  A re-run after the fixes below passed 12/12 again in 64.4 s.
+- **Hard stress test (re-run after fixes): 40 tasks, 34 passed, $0,
+  ~9.3 min** — volume 20/20, long output 2/3 + 1/1, adversarial 4/4,
+  edge cases 2/5 (3 designed failures), escalation correct, concurrency
+  4/4 with a clean shared log. The one real failure was a model error
+  the router caught honestly. Details: `STRESS-TEST.md`.
+- Fixes proven in that re-run: zero-check tasks are refused, the 300 s
+  default timeout lets ordinary tasks pass with no flags, and a retry
+  turned a failure into a pass by naming the failure reason (V06).
+- `check_cmd` is the real gate — `must_contain` / `format` are
+  tripwires, not proof. Write checks that pin the answer down.
 
-## Adapters
+## Files
 
-- `openai` (default) — OpenAI-compatible chat completions.
-- `identify` — a custom `/v1/identify` endpoint that takes a free-form prompt.
-- `ollama_ssh` — Ollama on another machine over one-shot SSH. The request body rides on the SSH stdin, never in a shell string. The SSH target and proxy in `router.py` are placeholders — set them to your own machine (see Setup).
+- `router.py` — the router (stdlib only)
+- `fake_server.py` — fake OpenAI-compatible model server for $0 testing
+- `tiers-test.json` — all tiers point at the fake server (test mode)
+- `tiers-real.json.example` — real endpoints for the PC (keys via env vars)
+- `tasks-suite.json` — the 7-task suite
+- `run_suite.py` — runs the suite, prints measured numbers
+- `break_tests.py` — the 10 break tests
+- `runs/` — logs, results, Plus handoffs
+- `BREAK-TEST-LOG.md` — what broke, what got fixed, re-test results
 
-Two measured behaviors are baked in:
-
-- qwen3:8b thinks before it speaks — 75–230 hidden thinking tokens per call. The `/v1` endpoint ignores `"think": false` but honors `"reasoning_effort": "none"`, which this router sends. Small replies came back empty until thinking was turned off.
-- The SSH exit code is not trusted for the success decision — the parsed JSON decides. (Root cause found the hard way: the remote shell split a single-quoted header, so curl fetched a phantom second URL and returned 6 while the real reply succeeded. The header now uses escaped double quotes.)
-
-## Setup
+## Run it (test mode, $0)
 
 ```bash
-cp tiers.json.example tiers.json
-# edit tiers.json: your endpoints, your models, your env-var key names
-python3 router.py --tiers tiers.json --task "Compute 6*7" --must-contain 42
+cd ~/workspace/luna-router
+python3 run_suite.py      # full 7-task suite, measured numbers
+python3 break_tests.py    # 10 break tests
 ```
 
-Task files are JSON lists:
+Single task:
 
-```json
-[{"id": "T1", "text": "Compute 6*7 and output the number alone.",
-  "must_contain": "42", "format": "^\\d+$",
-  "check_cmd": "grep -q 42"}]
+```bash
+python3 router.py --tiers tiers-test.json \
+  --task "Compute 6*7 and output the number alone." --must-contain 42
 ```
 
-`must_contain`, `format`, and `check_cmd` are all optional; when present, all of them must pass.
+The drivers start and stop the fake server themselves. No server is left
+running. No real API keys, no real API calls, no spending.
 
-Exit codes: `0` = every task passed, `1` = one or more tasks failed, `2` = usage/config error.
+## PC deploy (documented steps — NOT executed)
 
-For the `ollama_ssh` adapter, set the two placeholders in `router.py` to your own SSH target and proxy command, or remove the proxy line if your network does not need one. Never put an API key in a tiers file — keys come from environment variables only.
+On the owner's PC (RTX 3060 Ti, 8GB VRAM):
 
-## Proof
+1. Install Ollama: https://ollama.com/download (Windows installer).
+2. `ollama pull qwen2.5-coder:7b` (~4.7GB, Q4). Verify: `ollama run qwen2.5-coder:7b "Say the word BANANA"`.
+3. Copy `tiers-real.json.example` to `tiers-real.json` (never put a key in it).
+4. Set keys in the environment only when the owner approves paid use:
+   `GROQ_API_KEY`, `DEEPSEEK_API_KEY`. The router reads them from the
+   environment and never prints them.
+5. Run: `python router.py --tiers tiers-real.json --task-file tasks.json`
+   (copy `router.py` + a task file to the PC first; Python 3.10+).
+6. Start with the session budget low (`--session-budget 0.10` is the
+   default) and watch the first runs before raising it.
 
-2026-11-25, gauntlet proof run on a real workload: **12/12 checks verified, $0.00, 76.6 s total, qwen3:8b on one RTX 3060 Ti.** Full per-check table, method, and honest limits: [PROOF.md](PROOF.md).
+## Honest limits
 
-## Limits
-
-- The proof covers 12 of 20 gauntlet checks. The other 8 have no runnable command — they are recorded as not automatable, not faked.
-- One 8B model on one GPU runs one task at a time. A swarm of routers needs more machines.
-- Verification is only as good as the checks you write. A weak `check_cmd` passes weak answers.
+- Test-mode timings are fake-server times (near 0s), not real-model times.
+  Real latency depends on the model and the network.
+- Token counts are chars/4 estimates unless the server reports usage.
+- Verification is only as good as the task's checks. A weak check
+  (`must_contain` on a common word) can pass a wrong reply. Write checks
+  that pin the answer down.
+- Small models drop to 50–60% on three-step chains (research). The router
+  does not fix that; it detects it (verification fails) and escalates.
+  Long multi-step work still belongs on a bigger model.
+- The Plus handoff is manual by design. The router cannot know whether the
+  owner pasted it or what Plus answered.
+- The cost guard estimates an attempt's cost before calling; a model that
+  returns a much longer reply than assumed costs slightly more than
+  estimated. The guard is a brake, not a hard cap on a single in-flight call.
+- Not tested on Windows yet. Stdlib-only by construction.

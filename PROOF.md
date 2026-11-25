@@ -53,3 +53,24 @@ G12, G13, G14, G15, G16, G17, G19, G20 have no runnable command — prose pass c
 - Only G18 uses the gauntlet's own shipped script. G1–G11 ground truth is a faithful implementation of the prose pass criteria, each tested both ways (clean PASS, broken FAIL) before it earned a task.
 - The proof covers 12 of 20 checks. The other 8 are a gauntlet gap, not a router failure.
 - Gauntlet-text inaccuracies found during the run: G4's port claim does not match the file it cites; G10/G11's link check as naively stated false-positives on the clean tree; G12's "survey date" is not a field in README.md.
+
+## Stress test re-run (2026-11-25)
+
+After the gauntlet proof, the router was hard stress-tested (40 tasks,
+suites A–G), the three findings were fixed in `router.py`, and the full
+suite was re-run. Full report: `STRESS-TEST.md`.
+
+- **Re-run: 40 tasks, 34 passed, $0, ~9.3 min.** Volume 20/20,
+  adversarial 4/4, concurrency 4/4 (shared log intact, 0 corrupt
+  lines). Five of the six failures were designed to fail; the one real
+  failure (B03, a model counting error) was caught honestly — FAILED
+  plus a Plus handoff, no fake pass.
+- **Fixes proven live:** zero-check tasks are now refused (D05: refused
+  in 0.0 s, no model call); the default timeout is now 300 s (was 10 s)
+  so ordinary tasks pass with no flags (G01: 10.5 s, attempt 1); the
+  retry now re-asks with the failure reason attached and turned a
+  failure into a pass in-suite (V06).
+- **Gauntlet regression: 12/12 passed again** (64.4 s, $0) — the fixes
+  did not break the proven path.
+- **Verdict: ready to sell.** Remaining work is packaging, not engine
+  work.
